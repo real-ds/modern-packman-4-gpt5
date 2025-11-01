@@ -8,8 +8,15 @@ import math
 # -----------------------------
 TILE = 24
 FPS = 60
-NUM_GHOSTS = 4          # number of ghosts to spawn (use 3 or 4)
-SPAWN_FREEZE = 1.5      # seconds ghosts are frozen after each spawn/reset
+NUM_GHOSTS = 4           # number of ghosts to spawn (use 3 or 4)
+SPAWN_FREEZE = 1.5       # seconds ghosts are frozen after each spawn/reset
+
+# Movement smoothing
+TURN_THRESHOLD = max(6, TILE // 4)  # pixels from tile center to allow turning
+SNAP_ON_BUMP = True                 # snap to center axis when bumping a wall
+
+# Make corridors "feel" wider by using a smaller hitbox than the drawn sprite
+PACMAN_HITBOX_SHRINK = max(4, TILE // 6)   # shrink on each side (visual size unchanged)
 
 LEVEL_MAP = [
     "XXXXXXXXXXXXXXXXXXXXX",
@@ -111,7 +118,6 @@ class Level:
                 elif ch == 'G':
                     self.ghost_spawns.append((c, r))
         if self.pacman_spawn is None:
-            # fallback to a default open tile
             self.pacman_spawn = (1, 1)
         if not self.ghost_spawns:
             self.ghost_spawns = [(COLS//2, ROWS//2)]
@@ -135,7 +141,7 @@ class Level:
                 elif ch == 'o':
                     self.power.add((c, r))
 
-    # ------ NEW: corner spawn helpers ------
+    # ------ Corner spawn helpers ------
     def nearest_open(self, start_c, start_r):
         # Find the nearest non-wall tile from (start_c, start_r)
         if self.passable(start_c, start_r):
@@ -180,8 +186,9 @@ class Pacman:
         sx, sy = cell_to_center(*level.pacman_spawn)
         self.x = float(sx)
         self.y = float(sy)
-        self.size = int(TILE * 0.8)
-        self.speed = 120.0  # px/s
+        self.size = int(TILE * 0.8)  # visual size
+        self.hit_size = max(10, self.size - 2 * PACMAN_HITBOX_SHRINK)  # collision size
+        self.speed = 125.0  # px/s
         self.dir = DIRS["LEFT"]
         self.desired_dir = DIRS["LEFT"]
         self.alive = True
@@ -189,37 +196,61 @@ class Pacman:
         self.mouth_open = True
 
     def rect(self):
-        return rect_from_center(self.x, self.y, self.size)
+        # collision rect (smaller than drawn sprite)
+        return rect_from_center(self.x, self.y, self.hit_size)
 
-    def can_move_dir(self, direction, level, step=4):
-        # Test small step in desired direction
-        test_rect = self.rect().copy()
-        test_rect.centerx += direction[0] * step
-        test_rect.centery += direction[1] * step
-        for w in level.walls:
-            if test_rect.colliderect(w):
-                return False
-        return True
+    def _cell(self):
+        return pos_to_cell(self.x, self.y)
+
+    def _center(self):
+        c, r = self._cell()
+        return cell_to_center(c, r)
+
+    def _near_center_for_turn(self, d):
+        # Allow turn when close to tile center along the perpendicular axis
+        cx, cy = self._center()
+        if d[0] != 0:  # turning horizontal: must align vertically
+            return abs(self.y - cy) <= TURN_THRESHOLD
+        if d[1] != 0:  # turning vertical: must align horizontally
+            return abs(self.x - cx) <= TURN_THRESHOLD
+        return False
+
+    def _can_enter_dir(self, d):
+        c, r = self._cell()
+        nc, nr = c + d[0], r + d[1]
+        return self.level.passable(nc, nr)
 
     def update(self, dt, level):
-        # Try to change direction if requested and possible (near intersections)
-        if self.desired_dir != self.dir:
-            if self.can_move_dir(self.desired_dir, level, step=8):
-                self.dir = self.desired_dir
+        # 1) Input buffering and early turn: allow immediate reverse any time
+        if self.desired_dir == OPPOSITE.get(self.dir):
+            self.dir = self.desired_dir
 
-        # Move with collision resolution by axis
+        # 2) If the desired direction is available and we're close enough to center, snap and turn
+        if self.desired_dir != self.dir and self._can_enter_dir(self.desired_dir) and self._near_center_for_turn(self.desired_dir):
+            cx, cy = self._center()
+            if self.desired_dir[0] != 0:  # turning into LEFT/RIGHT -> align Y
+                self.y = cy
+            else:  # UP/DOWN -> align X
+                self.x = cx
+            self.dir = self.desired_dir
+
+        # 3) Move with axis-wise collision handling
         vx = self.dir[0] * self.speed * dt
         vy = self.dir[1] * self.speed * dt
+
+        collided_h = False
+        collided_v = False
 
         # Horizontal
         self.x += vx
         r = self.rect()
         for w in level.walls:
             if r.colliderect(w):
+                collided_h = True
                 if vx > 0:
-                    self.x = w.left - self.size / 2
+                    self.x = w.left - self.hit_size / 2
                 elif vx < 0:
-                    self.x = w.right + self.size / 2
+                    self.x = w.right + self.hit_size / 2
                 r.centerx = int(self.x)
 
         # Vertical
@@ -227,11 +258,22 @@ class Pacman:
         r = self.rect()
         for w in level.walls:
             if r.colliderect(w):
+                collided_v = True
                 if vy > 0:
-                    self.y = w.top - self.size / 2
+                    self.y = w.top - self.hit_size / 2
                 elif vy < 0:
-                    self.y = w.bottom + self.size / 2
+                    self.y = w.bottom + self.hit_size / 2
                 r.centery = int(self.y)
+
+        # 4) Cornering assist: if we bumped into a wall and the buffered turn is open, snap and turn
+        if (collided_h or collided_v) and self.desired_dir != self.dir and self._can_enter_dir(self.desired_dir):
+            cx, cy = self._center()
+            if SNAP_ON_BUMP:
+                if collided_h:
+                    self.y = cy  # align perpendicular axis
+                if collided_v:
+                    self.x = cx
+            self.dir = self.desired_dir
 
         # Mouth animation
         self.mouth_timer += dt
@@ -240,7 +282,7 @@ class Pacman:
             self.mouth_timer = 0.0
 
     def draw(self, surf):
-        # Draw Pac-Man with simple mouth animation
+        # Draw Pac-Man with simple mouth animation (uses visual size)
         center = (int(self.x), int(self.y))
         radius = self.size // 2
         angle = 0.35 if self.mouth_open else 0.05
@@ -462,6 +504,7 @@ class Game:
             g.dir = DIRS["STOP"]
 
     def handle_input(self):
+        # Event handling for quit/restart
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit(); sys.exit(0)
@@ -470,14 +513,17 @@ class Game:
                     pygame.quit(); sys.exit(0)
                 if event.key == pygame.K_r and self.game_over:
                     self.reset(run_full=True)
-                if event.key in (pygame.K_UP, pygame.K_w):
-                    self.pacman.desired_dir = DIRS["UP"]
-                elif event.key in (pygame.K_DOWN, pygame.K_s):
-                    self.pacman.desired_dir = DIRS["DOWN"]
-                elif event.key in (pygame.K_LEFT, pygame.K_a):
-                    self.pacman.desired_dir = DIRS["LEFT"]
-                elif event.key in (pygame.K_RIGHT, pygame.K_d):
-                    self.pacman.desired_dir = DIRS["RIGHT"]
+
+        # Continuous input (more responsive than only KEYDOWN)
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_UP] or keys[pygame.K_w]:
+            self.pacman.desired_dir = DIRS["UP"]
+        elif keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            self.pacman.desired_dir = DIRS["DOWN"]
+        elif keys[pygame.K_LEFT] or keys[pygame.K_a]:
+            self.pacman.desired_dir = DIRS["LEFT"]
+        elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            self.pacman.desired_dir = DIRS["RIGHT"]
 
     def update(self, dt):
         if self.game_over:
@@ -541,7 +587,7 @@ class Game:
                 g.frightened_speed = min(g.frightened_speed + 6, 160)
 
     def draw_grid(self, surf):
-        # Draw walls (rounded rectangles for aesthetics)
+        # Chunky tile walls (keep the classic blocky look)
         for w in self.level.walls:
             pygame.draw.rect(surf, BLUE, w)
 
